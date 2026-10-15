@@ -7,8 +7,7 @@
 //! [kitty protocol]: https://sw.kovidgoyal.net/kitty/graphics-protocol
 use std::borrow::Cow;
 use std::fmt::Write;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::protocol::UNIT_WIDTH;
 use crate::{Result, picker::cap_parser::Parser};
@@ -24,8 +23,10 @@ const PLACEHOLDER: char = '\u{10EEEE}';
 
 #[derive(Default, Clone)]
 struct KittyProtoState {
-    transmitted: Arc<AtomicBool>,
-    transmit_str: Option<String>,
+    /// The transmit sequence until it is first rendered; then the terminal holds the image and
+    /// the (often hundreds of kilobytes of) base64 data is dropped. Shared between clones, so
+    /// it is still transmitted only once.
+    transmit_str: Arc<Mutex<Option<String>>>,
     id: (u32, Color, u16), // Full ID, ID as fg color, ID extra part for diacritic
 }
 
@@ -34,21 +35,17 @@ impl KittyProtoState {
         let transmit_str = transmit_virtual(img, id, is_tmux, compress);
         let [id_extra, id_r, id_g, id_b] = id.to_be_bytes();
         Self {
-            transmitted: Arc::new(AtomicBool::new(false)),
-            transmit_str: Some(transmit_str),
+            transmit_str: Arc::new(Mutex::new(Some(transmit_str))),
             id: (id, Color::Rgb(id_r, id_g, id_b), u16::from(id_extra)),
         }
     }
 
     // Produce the transmit sequence or None if it has already been produced before.
-    fn make_transmit(&self) -> Option<&str> {
-        let transmitted = self.transmitted.swap(true, Ordering::SeqCst);
-
-        if transmitted {
-            None
-        } else {
-            self.transmit_str.as_deref()
-        }
+    fn make_transmit(&self) -> Option<String> {
+        self.transmit_str
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 }
 
@@ -148,7 +145,7 @@ fn render(
     size: Size,
     buf: &mut Buffer,
     (_, fg, id_extra): &(u32, Color, u16),
-    mut seq: Option<&str>,
+    mut seq: Option<String>,
     skip_line_count: usize,
 ) {
     // A position past the end of the diacritic table cannot be encoded, so
@@ -172,7 +169,7 @@ fn render(
             // Of course, this does not actually mean "rendered to terminal",
             // but rather "has been returned to user once for render".
             if let Some(seq) = seq.take() {
-                symbol.push_str(seq);
+                symbol.push_str(&seq);
             }
 
             symbol.push(PLACEHOLDER);
@@ -673,7 +670,7 @@ mod tests {
             Size::new(3, 2),
             &mut buf,
             &id_state(1),
-            Some("<TRANSMIT>"),
+            Some("<TRANSMIT>".to_string()),
             0,
         );
 
