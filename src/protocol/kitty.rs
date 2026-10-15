@@ -205,7 +205,8 @@ fn zlib(raw: &[u8]) -> Vec<u8> {
 
 /// Create a kitty escape sequence for transmitting and virtual-placement.
 ///
-/// The image will be transmitted as RGBA in chunks of 4096 bytes.
+/// The image will be transmitted as RGB if it is opaque and as RGBA otherwise, in chunks of 4096
+/// bytes.
 /// A "virtual placement" (U=1) is created so that we can place it using unicode placeholders.
 /// Removing the placements when the unicode placeholder is no longer there is being handled
 /// automatically by kitty.
@@ -229,12 +230,11 @@ fn transmit_virtual(
     compress: bool,
 ) -> String {
     let (w, h) = (img.width(), img.height());
-    let img_rgba8 = img.to_rgba8();
-    let raw = img_rgba8.as_raw();
+    let (format, raw) = pixels(img);
     let bytes: Cow<[u8]> = if compress {
-        Cow::Owned(zlib(raw))
+        Cow::Owned(zlib(&raw))
     } else {
-        Cow::Borrowed(raw)
+        raw
     };
     let compression = if compress { "o=z," } else { "" };
 
@@ -269,7 +269,7 @@ fn transmit_virtual(
             let (columns, rows) = (size.width, size.height);
             write!(
                 data,
-                "i={id},a=T,U=1,f=32,{compression}t=d,s={w},v={h},c={columns},r={rows},"
+                "i={id},a=T,U=1,f={format},{compression}t=d,s={w},v={h},c={columns},r={rows},"
             )
             .unwrap();
         }
@@ -285,6 +285,22 @@ fn transmit_virtual(
     }
 
     data
+}
+
+/// The pixels in the format the transmission names: 24-bit RGB for an opaque image, which is a
+/// quarter less to encode, send and store than RGBA with an alpha byte that is always 255, and
+/// 32-bit RGBA when some pixel is see-through. Borrowed when the image is laid out that way.
+fn pixels(img: &DynamicImage) -> (u8, Cow<'_, [u8]>) {
+    let opaque = match img {
+        DynamicImage::ImageRgba8(rgba) => rgba.pixels().all(|p| p.0[3] == u8::MAX),
+        _ => !img.color().has_alpha() || img.to_rgba8().pixels().all(|p| p.0[3] == u8::MAX),
+    };
+    match (img, opaque) {
+        (DynamicImage::ImageRgb8(rgb), _) => (24, Cow::Borrowed(rgb.as_raw())),
+        (DynamicImage::ImageRgba8(rgba), false) => (32, Cow::Borrowed(rgba.as_raw())),
+        (_, true) => (24, Cow::Owned(img.to_rgb8().into_raw())),
+        (_, false) => (32, Cow::Owned(img.to_rgba8().into_raw())),
+    }
 }
 
 /// From https://sw.kovidgoyal.net/kitty/_downloads/1792bad15b12979994cd6ecc54c967a6/rowcolumn-diacritics.txt
@@ -793,9 +809,26 @@ mod tests {
             "nothing claims to be compressed: {params}"
         );
         assert!(
-            params.contains("f=32") && params.contains("s=64,v=32"),
+            params.contains("f=24") && params.contains("s=64,v=32"),
             "{params}"
         );
+        assert_eq!(bytes, *img.to_rgb8().as_raw());
+    }
+
+    /// An opaque image goes out without its alpha channel, whatever layout it
+    /// came in, and one with see-through pixels keeps it.
+    #[test]
+    fn transmit_drops_the_alpha_channel_only_when_it_is_opaque() {
+        let rgb = DynamicImage::ImageRgb8(canvas().to_rgb8());
+        let (params, bytes) = reassemble(&transmit_virtual(&rgb, CELLS, 7, false, false));
+        assert!(params.contains("f=24"), "{params}");
+        assert_eq!(bytes, *rgb.to_rgb8().as_raw());
+
+        let mut see_through = canvas().to_rgba8();
+        see_through.get_pixel_mut(3, 3).0[3] = 0x80;
+        let img = DynamicImage::ImageRgba8(see_through);
+        let (params, bytes) = reassemble(&transmit_virtual(&img, CELLS, 7, false, false));
+        assert!(params.contains("f=32"), "{params}");
         assert_eq!(bytes, *img.to_rgba8().as_raw());
     }
 
@@ -813,7 +846,7 @@ mod tests {
             "the payload is compressed and says so: {params}"
         );
         assert!(
-            params.contains("f=32"),
+            params.contains("f=24"),
             "`o=z` is the encoding, `f` is the format: {params}"
         );
         assert!(
@@ -822,10 +855,10 @@ mod tests {
         );
         assert!(
             !params.contains("S="),
-            "`S` is for PNG-plus-compression, and this is f=32"
+            "`S` is for PNG-plus-compression, and this is f=24"
         );
 
-        let raw = img.to_rgba8();
+        let raw = img.to_rgb8();
         assert!(
             bytes.len() < raw.as_raw().len(),
             "{} vs {}",
