@@ -266,6 +266,16 @@ impl Picker {
         }
     }
 
+    /// Returns a new protocol that shows `image` in exactly `cells`, without resizing it.
+    ///
+    /// Kitty scales an image itself: it fits the image into the cells, keeping its aspect ratio,
+    /// and centres it. Leaving that to the terminal saves enlarging an image before sending it,
+    /// which only adds pixels, as well as fitting it to the cell grid. The other protocols draw
+    /// the pixels as they are, so for them the image must already match `cells` at the font size.
+    pub fn new_protocol_cells(&self, image: DynamicImage, cells: Size) -> Result<Protocol> {
+        self.new_protocol_raw(image, cells)
+    }
+
     /// Returns a new protocol for [`crate::Image`] widgets that fits into the given size.
     pub fn new_protocol(
         &self,
