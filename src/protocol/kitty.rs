@@ -53,6 +53,7 @@ impl KittyProtoState {
 pub struct Kitty {
     proto_state: KittyProtoState,
     size: Size,
+    is_tmux: bool,
 }
 
 impl Kitty {
@@ -64,7 +65,37 @@ impl Kitty {
         compress: bool,
     ) -> Result<Self> {
         let proto_state = KittyProtoState::new(&image, size, id, is_tmux, compress);
-        Ok(Self { proto_state, size })
+        Ok(Self {
+            proto_state,
+            size,
+            is_tmux,
+        })
+    }
+
+    /// The id the terminal knows the image by.
+    pub fn id(&self) -> u32 {
+        self.proto_state.id.0
+    }
+
+    /// Whether the transmission has been handed out for rendering, so the terminal holds the
+    /// image from the frame it was first drawn in.
+    pub fn transmitted(&self) -> bool {
+        self.proto_state
+            .transmit_str
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none()
+    }
+
+    /// The escape sequence that deletes the image from the terminal and frees its memory.
+    ///
+    /// A terminal keeps every transmitted image until it is told to delete it or its storage
+    /// quota is full. Write this once the image is no longer drawn: cells that still show it
+    /// go blank.
+    pub fn delete_sequence(&self) -> String {
+        let (start, escape, end) = Parser::tmux_start_escape_end(self.is_tmux);
+        let id = self.id();
+        format!("{start}{escape}_Ga=d,d=I,i={id},q=2{escape}\\{end}")
     }
 
     /// Only for SlicedImage
@@ -614,7 +645,8 @@ fn diacritic(y: u16) -> char {
 
 #[cfg(test)]
 mod tests {
-    use super::{DIACRITICS, PLACEHOLDER, diacritic, render, transmit_virtual};
+    use super::{DIACRITICS, Kitty, PLACEHOLDER, diacritic, render, transmit_virtual};
+    use crate::protocol::ProtocolTrait;
     use image::{DynamicImage, RgbaImage};
     use ratatui::buffer::Buffer;
     use ratatui::layout::{Rect, Size};
@@ -752,6 +784,30 @@ mod tests {
 
         assert_eq!(marks(&buf, 0, 0)[0], diacritic(5));
         assert_eq!(marks(&buf, 0, 1)[0], diacritic(6));
+    }
+
+    /// The image counts as transmitted once it has been rendered, not before.
+    #[test]
+    fn rendering_hands_out_the_transmission() {
+        let kitty = Kitty::new(canvas(), CELLS, 7, false, false).unwrap();
+        assert!(!kitty.transmitted());
+        let area = Rect::new(0, 0, CELLS.width, CELLS.height);
+        kitty.render(area, &mut Buffer::empty(area));
+        assert!(kitty.transmitted());
+    }
+
+    /// Deleting by id with an upper-case `I` frees the image data along with
+    /// its placements; `q=2` keeps the terminal from answering.
+    #[test]
+    fn the_delete_names_the_image_and_frees_it() {
+        let kitty = Kitty::new(canvas(), CELLS, 7, false, false).unwrap();
+        assert_eq!(kitty.delete_sequence(), "\x1b_Ga=d,d=I,i=7,q=2\x1b\\");
+
+        let in_tmux = Kitty::new(canvas(), CELLS, 7, true, false).unwrap();
+        assert_eq!(
+            in_tmux.delete_sequence(),
+            "\x1bPtmux;\x1b\x1b_Ga=d,d=I,i=7,q=2\x1b\x1b\\\x1b\\"
+        );
     }
 
     fn canvas() -> DynamicImage {
